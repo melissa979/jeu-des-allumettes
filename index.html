@@ -1155,55 +1155,42 @@ input[type="number"]:focus, input[type="text"]:focus {
     </div>
   </main>
   <script>
-// Regles du jeu : creation de la partie, coups valides, tour suivant.
-const Jeu = (() => {
-  function creer({ total = 17, mode = "deux", misere = false, noms = ["Joueur 1", "Joueur 2"] } = {}) {
-    return {
-      total,
-      restantes: total,
-      mode,            // "deux" | "machine" | "ia"
-      misere,          // true : celui qui prend la derniere allumette perd
-      noms,            // noms affiches des joueurs 1 et 2
-      courant: 0,      // 0 = joueur 1, 1 = joueur 2 (ou machine / IA)
-      historique: [],  // { joueur, nb, reste }
-      vainqueur: null  // index du gagnant une fois la partie finie
-    };
-  }
-
-  // On ne peut pas retirer plus de 3 allumettes, ni plus que ce qu'il reste
-  function maxRetrait(restantes) {
-    return Math.min(3, restantes);
-  }
-
-  function coupValide(etat, nb) {
-    return etat.vainqueur === null
-      && Number.isInteger(nb)
-      && nb >= 1
-      && nb <= maxRetrait(etat.restantes);
-  }
-
-  function jouer(etat, nb) {
-    if (!coupValide(etat, nb)) {
-      throw new Error("Coup invalide : " + nb);
-    }
-    const joueur = etat.courant;
-    etat.restantes -= nb;
-    etat.historique.push({ joueur, nb, reste: etat.restantes });
-    if (etat.restantes === 0) {
-      // Normal : celui qui prend la derniere gagne. Misere : il perd.
-      etat.vainqueur = etat.misere ? 1 - joueur : joueur;
-    } else {
-      etat.courant = 1 - joueur;
+// Communication avec Java : le navigateur envoie les actions au serveur Java (ServeurJeu)
+// et affiche l'etat de la partie qu'il renvoie. Aucune regle du jeu n'est ici.
+const Api = (() => {
+  // Java renvoie vainqueur = -1 tant que la partie continue ; l'interface utilise null
+  function adapter(etat) {
+    if ("vainqueur" in etat) {
+      etat.vainqueur = etat.vainqueur === -1 ? null : etat.vainqueur;
     }
     return etat;
   }
 
-  // Le joueur 2 est pilote par la machine ou l'IA dans ces modes
-  function estMachine(etat, index) {
-    return index === 1 && etat.mode !== "deux";
+  // Envoie une requete a Java (GET sans donnees, POST avec donnees) et lit la reponse JSON
+  async function appeler(chemin, donnees) {
+    const options = donnees === undefined ? {} : { method: "POST", body: new URLSearchParams(donnees) };
+    let reponse;
+    try {
+      reponse = await fetch(chemin, options);
+    } catch (e) {
+      throw new Error("Le serveur Java ne répond pas. Lancez-le avec : java ServeurJeu");
+    }
+    const json = await reponse.json();
+    if (!reponse.ok) {
+      throw new Error(json.erreur || "Erreur du serveur Java.");
+    }
+    return adapter(json);
   }
 
-  return { creer, maxRetrait, coupValide, jouer, estMachine };
+  return {
+    nouvelle: (c) => appeler("/api/nouvelle", {
+      total: c.total, mode: c.mode, misere: c.misere, nom1: c.noms[0], nom2: c.noms[1]
+    }),
+    jouer: (nb) => appeler("/api/jouer", { nb }),
+    ordinateur: () => appeler("/api/ordinateur", {}),
+    rejouer: () => appeler("/api/rejouer", {}),
+    indice: () => appeler("/api/indice")
+  };
 })();
 
 // Statistiques sauvegardees dans le navigateur (uniquement contre la machine ou l'IA)
@@ -1247,35 +1234,6 @@ const Stats = (() => {
   }
 
   return { enregistrer, resume };
-})();
-
-// Strategies de la machine (hasard) et de l'IA (strategie gagnante).
-const IA = (() => {
-  // Machine : retire au hasard entre 1 et min(3, restantes)
-  function choisirAleatoire(restantes) {
-    const max = Math.min(3, restantes);
-    return Math.floor(Math.random() * max) + 1;
-  }
-
-  // Coup optimal (ou le meilleur possible si la position est perdue)
-  function choisirIA(restantes, misere = false) {
-    if (!misere) {
-      // Normal : on laisse un multiple de 4 a l'adversaire
-      if (restantes <= 3) {
-        return restantes;          // on prend tout, c'est gagnant
-      }
-      const reste = restantes % 4;
-      return reste === 0 ? 3 : reste;
-    }
-    // Misere : on laisse a l'adversaire une position 4k+1 (1, 5, 9...)
-    if (restantes === 1) {
-      return 1;                    // position perdue, obligatoire
-    }
-    const r = (restantes - 1) % 4;
-    return r === 0 ? 1 : r;        // r === 0 : position perdue, on joue 1 pour prolonger
-  }
-
-  return { choisirAleatoire, choisirIA };
 })();
 
 // Sons generes par le code (Web Audio API), sans fichier audio. Activables / coupables.
@@ -1473,12 +1431,16 @@ const UI = (() => {
   let config = null;   // parametres de la derniere partie lancee
   let etat = null;     // etat courant de la partie
   let occupe = false;  // true pendant le coup de la machine ou l'animation de fin
+  let partie = 0;      // numero de la partie : une reponse d'une ancienne partie est ignoree
 
   // ---------- Navigation ----------
   document.querySelectorAll("[data-aller]").forEach((b) => {
     b.addEventListener("click", () => {
       UI.allerA(b.dataset.aller);
-      if (b.dataset.aller === "ecran-accueil") UI.stats(Stats.resume());
+      if (b.dataset.aller === "ecran-accueil") {
+        partie++;  // partie abandonnee : on ignore les reponses encore en attente
+        UI.stats(Stats.resume());
+      }
     });
   });
 
@@ -1535,42 +1497,60 @@ const UI = (() => {
   });
 
   // ---------- Partie ----------
-  function lancer() {
-    etat = Jeu.creer(config);
+  // Lance une partie : Java cree la partie (ou la relance si rejouer = true)
+  async function lancer(rejouer = false) {
+    const numero = ++partie;
+    try {
+      const recu = rejouer ? await Api.rejouer() : await Api.nouvelle(config);
+      if (numero !== partie) return;
+      etat = recu;
+    } catch (e) {
+      if ($("ecran-config").classList.contains("actif")) {
+        $("erreur-config").textContent = e.message;
+      } else {
+        alert(e.message);
+      }
+      return;
+    }
     occupe = false;
     UI.allerA("ecran-jeu");
     UI.rendre(etat);
     tourSuivant();
   }
 
-  // Decide qui joue ; l'affichage est deja a jour
+  // Decide qui joue ; l'affichage est deja a jour. C'est Java qui dit si c'est a l'ordinateur.
   function tourSuivant() {
     UI.conseil("");
-    if (Jeu.estMachine(etat, etat.courant)) {
+    if (etat.tourOrdinateur) {
       occupe = true;
       UI.majBoutons(etat, false);
       UI.majIndice(false);
       UI.indicateur(`${etat.noms[1]} réfléchit...`);
-      const ref = etat;
-      setTimeout(() => {
-        if (ref !== etat) return;  // partie abandonnee entre-temps
-        const nb = etat.mode === "ia"
-          ? IA.choisirIA(etat.restantes, etat.misere)
-          : IA.choisirAleatoire(etat.restantes);
-        occupe = false;
-        jouer(nb);
+      const numero = partie;
+      setTimeout(async () => {
+        if (numero !== partie) return;  // partie abandonnee entre-temps
+        try {
+          const avant = etat.restantes;
+          const recu = await Api.ordinateur();   // Java choisit et joue le coup
+          if (numero !== partie) return;
+          etat = recu;
+          occupe = false;
+          apresCoup(avant);
+        } catch (e) {
+          UI.indicateur(e.message);
+        }
       }, 900);
     } else {
       occupe = false;
       UI.majBoutons(etat, true);
       UI.majIndice(true);
-      UI.indicateur(`À vous, ${etat.noms[0]} : retirez 1 à 3 allumettes.`);
+      UI.indicateur(`À vous, ${etat.noms[etat.courant]} : retirez 1 à 3 allumettes.`);
     }
   }
 
-  function jouer(nb) {
-    const avant = etat.restantes;
-    Jeu.jouer(etat, nb);
+  // Apres un coup (humain ou ordinateur) : animation, son, puis fin de partie ou tour suivant
+  // avant : nombre d'allumettes avant le coup (sert a animer le retrait)
+  function apresCoup(avant) {
     UI.rendre(etat, avant);
     Son.jouer("frottement");
 
@@ -1583,9 +1563,9 @@ const UI = (() => {
         Stats.enregistrer(etat.vainqueur === 0);
         UI.stats(Stats.resume());
       }
-      const ref = etat;
+      const numero = partie;
       setTimeout(() => {
-        if (ref !== etat) return;
+        if (numero !== partie) return;
         // Son de victoire si le joueur 1 gagne, sinon son de defaite (en mode deux joueurs : victoire)
         const victoire = etat.mode === "deux" || etat.vainqueur === 0;
         Son.jouer(victoire ? "victoire" : "defaite");
@@ -1597,23 +1577,32 @@ const UI = (() => {
     tourSuivant();
   }
 
-  // Coup d'un humain, depuis un bouton ou le clavier
-  function jouerHumain(nb) {
-    if (!etat || occupe || etat.vainqueur !== null) return;
-    if (Jeu.estMachine(etat, etat.courant)) return;
-    if (!Jeu.coupValide(etat, nb)) return;
-    jouer(nb);
+  // Coup d'un humain, depuis un bouton ou le clavier : Java verifie et joue le coup
+  async function jouerHumain(nb) {
+    if (!etat || occupe || etat.vainqueur !== null || etat.tourOrdinateur) return;
+    occupe = true;  // evite un deuxieme clic pendant que Java repond
+    const numero = partie;
+    const avant = etat.restantes;
+    try {
+      const recu = await Api.jouer(nb);
+      if (numero !== partie) return;
+      etat = recu;
+      occupe = false;
+      apresCoup(avant);
+    } catch (e) {
+      if (numero !== partie) return;
+      occupe = false;
+      UI.conseil(e.message);  // par exemple : coup refuse par Java
+    }
   }
 
-  // Texte du coach : explique le meilleur coup
-  function texteConseil(e) {
-    const r = e.restantes;
-    const coup = IA.choisirIA(r, e.misere);
-    const perdante = e.misere ? (r - 1) % 4 === 0 : r % 4 === 0;
-    if (perdante) {
+  // Texte du coach : Java calcule le meilleur coup, ici on ne fait que la phrase
+  function texteConseil(e, indice) {
+    const coup = indice.coup;
+    if (indice.perdante) {
       return `Position difficile : si l'adversaire joue bien, vous perdrez. Essayez ${coup} pour lui laisser une chance de se tromper.`;
     }
-    const laisse = r - coup;
+    const laisse = e.restantes - coup;
     if (e.misere) {
       return `Retirez ${coup} : il restera ${laisse}, une position perdante pour l'adversaire.`;
     }
@@ -1627,9 +1616,14 @@ const UI = (() => {
     b.addEventListener("click", () => jouerHumain(Number(b.dataset.retrait)));
   });
 
-  $("btn-indice").addEventListener("click", () => {
-    if (!etat || occupe || etat.vainqueur !== null || Jeu.estMachine(etat, etat.courant)) return;
-    UI.conseil(texteConseil(etat));
+  $("btn-indice").addEventListener("click", async () => {
+    if (!etat || occupe || etat.vainqueur !== null || etat.tourOrdinateur) return;
+    try {
+      const indice = await Api.indice();  // Java calcule le meilleur coup
+      UI.conseil(texteConseil(etat, indice));
+    } catch (e) {
+      UI.conseil(e.message);
+    }
   });
 
   $("btn-son").addEventListener("click", () => {
@@ -1644,7 +1638,7 @@ const UI = (() => {
   });
 
   $("btn-rejouer").addEventListener("click", () => {
-    if (config) lancer();
+    if (config) lancer(true);
   });
 
   // ---------- Initialisation ----------
