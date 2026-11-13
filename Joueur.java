@@ -3,6 +3,22 @@ import java.util.Scanner;
 class Joueur {
     static final Scanner clavier = new Scanner(System.in);
 
+    private String nom;
+
+    // Constructeur sans argument : garde le comportement du sujet (new Joueur())
+    public Joueur() {
+        this("Joueur");
+    }
+
+    // Constructeur avec le nom du joueur (utilise par l'interface graphique)
+    public Joueur(String nom) {
+        this.nom = nom;
+    }
+
+    public String getNom() {
+        return nom;
+    }
+
     // Version du sujet : entier entre 1 et 3 (F2, F3)
     public int propositionJoueur() {
         return propositionJoueur(3);
